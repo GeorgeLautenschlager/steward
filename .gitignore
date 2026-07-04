@@ -1,4 +1,4 @@
 # Ephemeral per-run state (ledger, runlog). Folded into the PR, not committed.
-# Issue #4 (fs-conventions) formalizes the full policy; this is the minimal
-# entry the brief already specifies. See .steward/runs/3/ledger.md L4.
+# .steward/metrics.jsonl is deliberately NOT ignored — it is committed.
+# Policy authority: docs/CONVENTIONS.md.
 .steward/runs/
