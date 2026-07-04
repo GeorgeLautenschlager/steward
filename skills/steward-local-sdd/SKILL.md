@@ -37,7 +37,8 @@ If the local model isn't available, or the tasks need frontier-level reasoning t
 Identical to base, except the implementer (initial dispatch and every fix re-dispatch) is a
 local `pi -p` call instead of a Task subagent. Both reviewers remain Task subagents. Steward adds
 two things on top: every dispatch carries the [Steward Dispatch Payload](#steward-dispatch-payload)
-(brief + issue + `DECISIONS.md` + ledger protocol), and each resolved review stage is persisted to
+(issue + its Decisions & Defaults + `DECISIONS.md` + ledger protocol — deliberately not the brief),
+and each resolved review stage is persisted to
 the [runlog](#capturing-the-review-trail-runlog) instead of dying in-session (the two `→ runlog`
 notes in the graph).
 
@@ -96,10 +97,10 @@ implementer (and its fixes) run locally.
 ### Building the prompt
 
 1. **Assemble the steward context pack** (see [Steward Dispatch Payload](#steward-dispatch-payload)
-   below). This is the standing law and protocol the implementer needs to resolve ambiguity
-   without asking: the project brief, the issue body, the target repo's `DECISIONS.md` (if
-   present), and this skill's `./ledger-protocol.md`. It goes **first**, before the implementer
-   body.
+   below). This is the **settled** decision context the implementer needs to resolve ambiguity
+   without asking: the issue body (with its Decisions & Defaults excerpts), the target repo's
+   `DECISIONS.md` (if present), and this skill's `./ledger-protocol.md` — **and not the project
+   brief** (see the section for why). It goes **first**, before the implementer body.
 2. **Read the unchanged upstream implementer body** from the installed base skill:
    `superpowers:subagent-driven-development/implementer-prompt.md`. Use the text *inside* its
    `prompt: |` block — the same body you would have put in a Task subagent. Fill in Task
@@ -113,31 +114,40 @@ implementer (and its fixes) run locally.
 
 ### Steward Dispatch Payload
 
-This is steward's extension over the base skill: **every** dispatch (initial and every fix
-re-dispatch) carries the full decision context, so the implementer can resolve ambiguity from
-standing law instead of guessing or stalling. The controller assembles the pack; it is prepended
-to the implementer body in this order:
+This is steward's extension over the base skill: every dispatch (initial and every fix re-dispatch)
+carries the **settled** decision context the implementer needs to resolve ambiguity without asking
+— and **nothing more**. The controller assembles the pack; it is prepended to the implementer body
+in this order:
 
-1. **Project brief** — the approved brief for the target project (its `BRIEF-*.md`), verbatim.
-   The implementer's ground truth for intent.
-2. **This issue** — the issue body being implemented, including any *Decisions & Defaults*
-   excerpts, verbatim.
-3. **Standing decisions** — the contents of the target repo's root `DECISIONS.md` if it exists;
+1. **This issue** — the issue body being implemented, including its *Decisions & Defaults*
+   excerpts, verbatim. Per the decomposition protocol each issue already carries the decisions
+   relevant to *this* task; that excerpt — not the whole brief — is how settled decisions reach the
+   implementer.
+2. **Standing decisions** — the contents of the target repo's root `DECISIONS.md` if it exists;
    otherwise the literal line `DECISIONS.md: none yet — ledger every assumption` (graceful
    degradation, per `docs/DECISION-LIFECYCLE.md`).
-4. **Decision & ledger protocol** — `./ledger-protocol.md` verbatim, the implementer-facing
+3. **Decision & ledger protocol** — `./ledger-protocol.md` verbatim, the implementer-facing
    capsule of the decision lifecycle (resolution ladder, hard-stop class, ledger entry format).
 
-The brief, issue, and `DECISIONS.md` live in the **target repo**; `ledger-protocol.md` ships with
-this skill so the protocol is present even when the target repo has no steward files yet. Assemble
-each behind a clear `## ` heading so the implementer can tell them apart, e.g.:
+**Deliberately *not* included: the project brief.** Injecting the whole brief works against the
+point of decomposition — **context isolation**. The brief is where decisions get *argued*; by the
+time an issue is dispatched, those decisions are *made*. Handing the implementer the brief invites
+it to re-read and re-litigate settled choices — wasted effort at best, drift at worst. Settled
+decisions must arrive **already settled**, as the issue's Decisions & Defaults excerpts and
+`DECISIONS.md` entries, in directive form. If a decision the task needs is in neither, that is a
+decomposition gap: the implementer takes a reversible default and ledgers it, or stops with
+`NEEDS_CONTEXT` — it does **not** go spelunking in the brief. (Standing decision, steward
+`DECISIONS.md` 2026-07-04; supersedes the "brief" item in issue #6 and brief C3.)
+
+The issue and `DECISIONS.md` live in the **target repo**; `ledger-protocol.md` ships with this
+skill so the protocol is present even when the target repo has no steward files yet. Assemble each
+behind a clear `## ` heading so the implementer can tell them apart, e.g.:
 
 ```bash
 CONTEXT_PACK=$(mktemp)
 {
   printf '# Dispatch context (read before the task)\n\n'
-  printf '## Project brief\n\n';       cat "$BRIEF_PATH"
-  printf '\n\n## This issue\n\n';      cat "$ISSUE_BODY_PATH"
+  printf '## This issue\n\n';      cat "$ISSUE_BODY_PATH"
   printf '\n\n## Standing decisions\n\n'
   if [ -f "$WORKTREE/DECISIONS.md" ]; then cat "$WORKTREE/DECISIONS.md"
   else printf 'DECISIONS.md: none yet — ledger every assumption\n'; fi
@@ -149,7 +159,7 @@ CONTEXT_PACK=$(mktemp)
 
 ```bash
 PROMPT=$(mktemp)
-{ cat "$CONTEXT_PACK";                            # steward payload: brief + issue + DECISIONS.md + ledger-protocol
+{ cat "$CONTEXT_PACK";                            # steward payload: issue + DECISIONS.md + ledger-protocol (no brief)
   printf '\n\n%s\n\n' "$IMPLEMENTER_BODY_WITH_CONTEXT";
   cat local-implementer-footer.md; } > "$PROMPT"  # footer last — it overrides anything above that assumes a chat
 
@@ -330,8 +340,10 @@ Everything in the base skill's Red Flags applies. **Additionally, never:**
 - **Route either reviewer to the local model** — review stays frontier.
 - **Keep bouncing a non-converging fix loop past the cap** — escalate to the human instead.
 - **Dispatch local implementers in parallel** — same as base, conflicts.
-- **Dispatch without the context pack** — an implementer that can't see the brief, issue, and
-  ledger protocol will guess instead of ledger. The payload is not optional.
+- **Dispatch without the context pack** — an implementer that can't see the issue's decisions,
+  `DECISIONS.md`, and the ledger protocol will guess instead of ledger. The payload is not optional.
+- **Dispatch the whole project brief** — it breaks context isolation and invites re-litigation of
+  settled decisions. Settled decisions arrive via the issue's D&D excerpts and `DECISIONS.md` only.
 - **Let a review stage die in-session** — every resolved stage lands in the runlog, findings *and*
   resolution. An empty runlog after a reviewed task is a bug.
 
@@ -350,7 +362,8 @@ Everything in the base skill's Red Flags applies. **Additionally, never:**
   it carries through to the local run.
 
 **Steward context this skill reads (target repo + this skill dir):**
-- The project **brief** (`BRIEF-*.md`) and the **issue body** — the dispatch payload's intent.
+- The **issue body** with its Decisions & Defaults excerpts — the dispatch payload's task + settled
+  decisions. (The project brief is deliberately **not** dispatched — see Steward Dispatch Payload.)
 - The target repo's root **`DECISIONS.md`** if present — standing law (graceful degradation per
   `docs/DECISION-LIFECYCLE.md` when absent).
 - **`./ledger-protocol.md`** — implementer-facing capsule of `docs/DECISION-LIFECYCLE.md`.
