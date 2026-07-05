@@ -23,7 +23,16 @@ claude --plugin-dir /path/to/steward
 
 `/reload-plugins` picks up edits mid-session.
 
+To auto-load it in every session instead of passing `--plugin-dir`, register
+the repo as a local `directory` marketplace in `~/.claude/settings.json`
+(`extraKnownMarketplaces` + `enabledPlugins: { "steward@steward-dev": true }`)
+— the manifest below makes it self-installable. Don't pass `--plugin-dir` as
+well when it's enabled this way, or the plugin loads twice.
+
 ## Layout
 
-- `.claude-plugin/plugin.json` — plugin manifest (the only thing inside `.claude-plugin/`).
-- `skills/` — plugin skills (empty at v0.1.0); lives at plugin root.
+- `.claude-plugin/plugin.json` — plugin manifest.
+- `.claude-plugin/marketplace.json` — self-listing so the repo is installable as
+  a one-plugin `directory` marketplace. These two are the only things inside
+  `.claude-plugin/`.
+- `skills/` — plugin skills; lives at plugin root.
