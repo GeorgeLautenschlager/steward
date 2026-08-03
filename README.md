@@ -1,7 +1,7 @@
 # steward
 
-A standalone Claude Code plugin that restructures the George → Opus → Blueberry
-pipeline around a single metric: **efficiency of George's attention spend.**
+A standalone Claude Code plugin that restructures the George → Opus → Blueberry (Local coding agent)
+pipeline around a single metric: **efficiency of my attention spend.**
 
 Successor to the `superpowers-local-subagent` fork.
 
@@ -10,10 +10,10 @@ Successor to the `superpowers-local-subagent` fork.
 
 ## What it does
 
-George is the bottleneck in the pipeline, and his attention leaks in four
+I'm usually the bottleneck in the pipeline, and my attention leaks in four
 places: under-invested briefs, decomposition sized by convenience, synchronous
 mid-flight interruptions, and final review that re-verifies work already
-verified in-session. Steward closes those leaks so George spends **judgment
+verified in-session. Steward closes those leaks so I spend **judgment
 only, always batched, never interrupted** between "decomposition approved" and
 "PR ready for review."
 
