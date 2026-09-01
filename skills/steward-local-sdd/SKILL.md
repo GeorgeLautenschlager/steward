@@ -176,10 +176,18 @@ PROMPT=$(mktemp)
 cd "$WORKTREE"
 BASE_SHA=$(git rev-parse HEAD)                 # capture BEFORE the run, for the quality reviewer
 
-pkill -f '(^|/)pi -p' 2>/dev/null              # clear stray HEADLESS implementers only (see below)
+# Clear stray HEADLESS implementers only. pi's process title is bare `pi` — its arguments
+# are NOT visible to pkill -f — so headless runs are identified by having no tty. (See below.)
+for p in $(pgrep -x pi); do
+  [ "$(ps -o tty= -p "$p" | tr -d ' ')" = "?" ] && kill -TERM "$p"
+done
+
 timeout -k 10 --signal=TERM "$BUDGET_SECONDS" \
   pi -p --thinking low < "$PROMPT" \
-  > out.txt 2> err.txt
+  > out.txt 2> err.txt &
+TIMEOUT_PID=$!
+PI_PID=$(pgrep -P "$TIMEOUT_PID" -x pi)   # the process to kill if YOU need to abort this run
+wait "$TIMEOUT_PID"
 rc=$?
 
 # Tolerant parse: the model may emit a bare `STATUS: DONE` OR markdown `**Status:** DONE`
@@ -200,21 +208,40 @@ HEAD_SHA=$(git rev-parse HEAD)                  # capture AFTER, for the quality
   generation; the orphaned generation then wedges the local model so every *subsequent* dispatch
   hangs on its first inference (frozen, empty output) until you kill the strays. SIGTERM lets pi
   abort the generation and clean up its children; `-k 10` is a 10s backstop if it ignores TERM.
-  The defensive `pkill -f '(^|/)pi -p'` before each dispatch clears any orphan a previous run
+  The defensive tty-filtered sweep before each dispatch clears any orphan a previous run
   left behind. (This was the single biggest failure mode in the e2e shakedown — see brief §11.)
-- **Scope the pkill to headless runs — never `pkill -x pi`.** `pkill -x pi` matches *every*
-  process named `pi`, including an interactive pi session the human has open in another terminal
-  — it kills their session out from under them. The `-f '(^|/)pi -p'` pattern matches only
-  print-mode (headless) invocations, which are the only ones this skill dispatches and therefore
-  the only ones it may kill.
-- **Keep the `(^|/)` anchor — do not "simplify" the pattern to `pkill -f 'pi -p'`.** `pkill -f`
-  matches against every process's *full* command line, including the command line of the shell
-  that is running this very dispatch script — which contains the literal text `pi -p`. The
-  unanchored pattern therefore kills its own wrapping shell: the dispatch dies mid-script with a
-  signal exit code (144 observed) and no output, and you will waste an afternoon blaming the
-  model. The anchor saves it because in the wrapper's command line `pi -p` is always preceded by
-  a quote, a space, or a newline — never by start-of-string or `/` — while a real orphan's
-  command line begins with `pi -p` or `/path/to/pi -p`. That asymmetry is load-bearing.
+- **Identify headless pi by its *tty*, not by its arguments.** This is the one that has been
+  got wrong twice, so verify it against a live process before you trust any pattern.
+
+  **pi's command line is the single word `pi`.** It is a Node script that rewrites its process
+  title, so `-p`, `--thinking`, `--session-dir` and everything else are **invisible to `pkill -f`**.
+  Confirmed against a running dispatch:
+
+  ```
+  $ ps -eo pid,tty,args | awk '$3=="pi"'
+  3434091 ?        pi                  # <- the entire command line
+
+  pgrep -x pi                -> 3434091      # matches
+  pgrep -f '(^|/)pi -p'      -> (nothing)    # matches NOTHING
+  ```
+
+  So any `pkill -f` pattern built around `pi -p` is **inert** — it never kills the orphan it was
+  written to kill, and it looks safe only because it does nothing. (Worse, an *unanchored*
+  `pkill -f 'pi -p'` is not inert: it matches the dispatch script's own shell, whose command line
+  does contain that text, and kills the run from inside itself — reproduced, exit 144.)
+
+  `pkill -x pi` matches by process *name* and therefore does work — which is why it was the
+  original instruction — but it is indiscriminate: it also kills an interactive pi session the
+  human has open in another terminal, out from under them.
+
+  The discriminator that actually separates the two is the **controlling terminal**: a headless
+  dispatch has `tty=?`, an interactive session has a real pts. Hence the loop in the invocation
+  above. Caveat: a human running their *own* headless `pi -p` on this box would also have no tty
+  and would be swept — rare, but say so rather than pretend the filter is exact.
+
+- **To abort the run you started, kill `$PI_PID` — do not sweep.** The invocation captures the
+  pid; killing it directly needs no pattern matching and cannot touch anyone else's session.
+  Pattern sweeps are only for orphans left by an *earlier* run, whose pid you no longer have.
 - **`--thinking low` is the dispatch default, and always pass the flag explicitly.** The failure
   it guards against is a **runaway reasoning loop**: thinking tokens and output tokens come out of
   one fixed **16,384-token output budget**, and the model can spend the entire budget reasoning
@@ -249,7 +276,7 @@ HEAD_SHA=$(git rev-parse HEAD)                  # capture AFTER, for the quality
   exit**, so a killed run yields empty `out.txt` even if work landed. **Do not trust stdout.**
   Inspect git instead: `git -C "$WORKTREE" log --oneline "$BASE_SHA"..HEAD` and `git status`. If
   commits landed and the tree is clean, salvage as `DONE_WITH_CONCERNS` and send to review (the
-  reviewer is the real gate). Otherwise `pkill -f '(^|/)pi -p'`, then treat as `BLOCKED` and
+  reviewer is the real gate). Otherwise sweep tty-less `pi` processes, then treat as `BLOCKED` and
   re-dispatch once with a larger budget; if it times out again, escalate. **A timeout is also your
   cue to clear orphans before the next dispatch**, or it too will hang.
 - **Clean exit, but no commits and no output:** don't guess — read the **`stopReason`** from pi's
@@ -289,8 +316,8 @@ chat memory:
 - `git -C "$WORKTREE" diff "$BASE_SHA"..HEAD` so it sees exactly what was built.
 - The same footer (it will read current files in the worktree directly).
 
-Dispatch the fix run with the **same Invoking discipline** as above (scoped
-`pkill -f '(^|/)pi -p'` first, prompt on stdin not `@file`, `--thinking low`,
+Dispatch the fix run with the **same Invoking discipline** as above (tty-filtered orphan
+sweep first, prompt on stdin not `@file`, `--thinking low`,
 `--signal=TERM -k 10`, tolerant status parse). The fix prompt carries a full
 `git diff "$BASE_SHA"..HEAD`, so it is the dispatch most likely to blow the argv ceiling —
 another reason stdin is the default. After it commits, advance `HEAD_SHA` and re-review.
@@ -404,10 +431,10 @@ Everything in the base skill's Red Flags applies. **Additionally, never:**
 - **Run `pi -p` without a `timeout` wrapper** — it hangs indefinitely on model eviction and on the
   resume bug, with no error and no output.
 - **Hard-kill pi with `--signal=KILL`** — it orphans the LM Studio server-side generation and wedges
-  the local model for every following dispatch. Use `--signal=TERM -k 10`, and a scoped
-  `pkill -f '(^|/)pi -p'` to clear any orphan before the next dispatch.
-- **`pkill -x pi`** — it matches every process named `pi`, interactive sessions included, and
-  kills the human's open session. Only ever kill headless print-mode processes.
+  the local model for every following dispatch. Use `--signal=TERM -k 10`, and a tty-filtered
+  sweep to clear any orphan before the next dispatch.
+- **Bare `pkill -x pi`** — it matches every process named `pi`, interactive sessions included,
+  and kills the human's open session. Filter to `tty=?` first.
 - **Deliver the prompt with `@file`** — pi treats attached files as untrusted input and refuses
   to follow instructions inside them; the dispatch dies as a refusal. The prompt goes in on stdin.
 - **Pass a large prompt as an argv argument** — a single argument is capped at 131072 bytes
@@ -417,8 +444,11 @@ Everything in the base skill's Red Flags applies. **Additionally, never:**
   `settings.json` (`xhigh` on the reference host), and thinking shares one 16,384-token output
   budget it can consume entirely before the first tool call, producing a silent no-op run.
   `medium` was measured failing on a real task. Pass the flag explicitly; default `low`.
-- **Unanchor the pkill pattern** — `pkill -f 'pi -p'` matches the dispatch script's own shell
-  command line and kills the run from inside itself. Keep `(^|/)`.
+- **Match pi by its arguments** — pi rewrites its process title to the bare word `pi`, so
+  **no** `pkill -f` pattern containing `-p` or any other flag will ever match it. Such a pattern
+  is inert: it silently fails to clear the orphan it exists to clear. Match on name (`-x pi`)
+  and discriminate by tty. Verify any new pattern against `ps -eo pid,tty,args` on a *live*
+  dispatch before trusting it — this has been got wrong twice.
 - **Trust `out.txt` after a timeout** — stdout is buffered and lost on kill; judge progress from
   git state in the worktree.
 - **Shrug off a no-output run as "the model failed"** — read `stopReason` from the newest session
