@@ -109,11 +109,18 @@ implementer (and its fixes) run locally.
 3. **Append this skill's footer**, `./local-implementer-footer.md`, verbatim. The footer
    reconciles the interactive base body with headless execution and defines the machine-parseable
    `STATUS:` contract. It stays last — it says "read this last."
-4. Write the assembled prompt to a temp file and pass its **contents as the prompt argument**
-   (`pi -p "$(cat "$PROMPT")"`). Do **not** deliver it with `@file`: pi treats `@file` content as
+4. Write the assembled prompt to a temp file and feed it to pi **on stdin**
+   (`pi -p ... < "$PROMPT"`). Do **not** deliver it with `@file`: pi treats `@file` content as
    an untrusted *attachment*, not as the operator's prompt, and refuses to follow the instructions
-   inside it — the run dies with a refusal instead of implementing. Argv is the trusted channel,
-   and Linux's ~2MB argv ceiling is ample for any sane context pack.
+   inside it — the run dies with a refusal instead of implementing.
+
+   Argv (`pi -p "$(cat "$PROMPT")"`) is also a trusted channel and works for small packs, but it
+   is **not** bounded by `ARG_MAX` (2MB) as you might assume: Linux caps any *single* argument at
+   `MAX_ARG_STRLEN` = 32 pages = **131072 bytes**, and the whole prompt is one argument. Past that
+   the exec fails with `E2BIG` before pi ever starts — which looks exactly like the silent no-op
+   run described below, with an empty `out.txt` and no session file to diagnose. A fix re-dispatch
+   appends a full `git diff "$BASE_SHA"..HEAD`, so this ceiling is genuinely reachable. Stdin has
+   no such limit; prefer it always.
 
 ### Steward Dispatch Payload
 
@@ -171,7 +178,7 @@ BASE_SHA=$(git rev-parse HEAD)                 # capture BEFORE the run, for the
 
 pkill -f '(^|/)pi -p' 2>/dev/null              # clear stray HEADLESS implementers only (see below)
 timeout -k 10 --signal=TERM "$BUDGET_SECONDS" \
-  pi -p --thinking high "$(cat "$PROMPT")" \
+  pi -p --thinking low < "$PROMPT" \
   > out.txt 2> err.txt
 rc=$?
 
@@ -200,12 +207,40 @@ HEAD_SHA=$(git rev-parse HEAD)                  # capture AFTER, for the quality
   — it kills their session out from under them. The `-f '(^|/)pi -p'` pattern matches only
   print-mode (headless) invocations, which are the only ones this skill dispatches and therefore
   the only ones it may kill.
-- **`--thinking high`, not `xhigh`.** Thinking tokens and output tokens share one budget, and at
-  `xhigh` the local model can spend the **entire** output budget reasoning before its first tool
-  call — the run exits "cleanly" with no commits, no status line, and nothing in `out.txt`.
-  `high` leaves headroom for actual work. Raise to `xhigh` only for a specific task that
-  demonstrably needs it, and if that run comes back empty, check `stopReason` (see Reading the
-  result) before blaming the model.
+- **Keep the `(^|/)` anchor — do not "simplify" the pattern to `pkill -f 'pi -p'`.** `pkill -f`
+  matches against every process's *full* command line, including the command line of the shell
+  that is running this very dispatch script — which contains the literal text `pi -p`. The
+  unanchored pattern therefore kills its own wrapping shell: the dispatch dies mid-script with a
+  signal exit code (144 observed) and no output, and you will waste an afternoon blaming the
+  model. The anchor saves it because in the wrapper's command line `pi -p` is always preceded by
+  a quote, a space, or a newline — never by start-of-string or `/` — while a real orphan's
+  command line begins with `pi -p` or `/path/to/pi -p`. That asymmetry is load-bearing.
+- **`--thinking low` is the dispatch default, and always pass the flag explicitly.** The failure
+  it guards against is a **runaway reasoning loop**: thinking tokens and output tokens come out of
+  one fixed **16,384-token output budget**, and the model can spend the entire budget reasoning
+  without ever emitting its first tool call. The run then exits "cleanly" — rc 0, no commits, no
+  status line, nothing in `out.txt`. The signature in the session file is unmistakable:
+  `"stopReason": "length"`, `usage.output` exactly `16384`, and a final message whose content
+  parts are `['thinking']` and nothing else.
+
+  **The burn is task-dependent, not simply level-dependent** — measured, not assumed. On one real
+  implementation task, `xhigh` burned the full budget and `medium` burned it too; `low` completed.
+  But on a trivial one-tool-call task, `high` finished in 37s using **71 output tokens with 64
+  spent on thinking** — three orders of magnitude of headroom. So a higher level does not
+  deterministically burn the budget; it raises the probability that a task the model finds hard or
+  underspecified tips into the loop. Since dispatches here are real implementation tasks, default
+  `low`. Climb the ladder (`off, minimal, low, medium, high, xhigh, max`) one rung at a time for a
+  task that demonstrably needs it, and drop back on the first `length` stop.
+
+  **Pass `--thinking` explicitly on every dispatch.** The level is read from
+  `~/.pi/agent/settings.json` (`defaultThinkingLevel`) when the flag is absent, and on the
+  reference host that default is `xhigh` — the exact setting that produced the burn. Never rely on
+  the ambient config.
+
+  Note that the level you dispatched with is **not** recoverable from the session file — the
+  `thinkingLevel` it records tracks neither the flag nor the settings default (observed as `"off"`
+  on runs dispatched at both `xhigh` and `medium`). Log the level in the runlog, or you cannot
+  reconstruct which rung failed.
 
 ### Reading the result (spike + e2e hardened — see brief §11)
 
@@ -223,9 +258,16 @@ HEAD_SHA=$(git rev-parse HEAD)                  # capture AFTER, for the quality
   place the run says why it stopped:
 
   ```bash
-  SESSION=$(ls -t ~/.pi/agent/sessions/*.jsonl 2>/dev/null | head -1)
+  # Sessions are stored in a PER-PROJECT subdirectory (the cwd path, slugified) — a flat
+  # ~/.pi/agent/sessions/*.jsonl glob matches nothing and silently yields an empty $SESSION.
+  SESSION=$(find ~/.pi/agent/sessions -name '*.jsonl' -printf '%T@ %p\n' 2>/dev/null \
+            | sort -rn | head -1 | cut -d' ' -f2-)
   grep -o '"stopReason"[[:space:]]*:[[:space:]]*"[^"]*"' "$SESSION" | tail -1
   ```
+
+  Scope it to the worktree you dispatched into when other pi sessions may be running concurrently
+  — `find ~/.pi/agent/sessions -path "*$(echo "$WORKTREE" | tr / -)*" -name '*.jsonl'` — otherwise
+  "newest session anywhere" can hand you an unrelated project's run.
 
   Interpret it: a length/max-tokens stop means the output budget ran out — usually thinking burn
   (see `--thinking` above); lower the thinking level and re-dispatch fresh. An error stop means
@@ -248,8 +290,10 @@ chat memory:
 - The same footer (it will read current files in the worktree directly).
 
 Dispatch the fix run with the **same Invoking discipline** as above (scoped
-`pkill -f '(^|/)pi -p'` first, prompt via argv not `@file`, `--signal=TERM -k 10`, tolerant
-status parse). After it commits, advance `HEAD_SHA` and re-review.
+`pkill -f '(^|/)pi -p'` first, prompt on stdin not `@file`, `--thinking low`,
+`--signal=TERM -k 10`, tolerant status parse). The fix prompt carries a full
+`git diff "$BASE_SHA"..HEAD`, so it is the dispatch most likely to blow the argv ceiling —
+another reason stdin is the default. After it commits, advance `HEAD_SHA` and re-review.
 The cwd worktree guarantees commits land on the task branch.
 
 ### Convergence guard
@@ -365,10 +409,16 @@ Everything in the base skill's Red Flags applies. **Additionally, never:**
 - **`pkill -x pi`** — it matches every process named `pi`, interactive sessions included, and
   kills the human's open session. Only ever kill headless print-mode processes.
 - **Deliver the prompt with `@file`** — pi treats attached files as untrusted input and refuses
-  to follow instructions inside them; the dispatch dies as a refusal. The prompt goes in as the
-  argv prompt argument.
-- **Default to `--thinking xhigh`** — thinking shares the output budget and can consume all of it
-  before the first tool call, producing a silent no-op run. Default `high`; raise per-task only.
+  to follow instructions inside them; the dispatch dies as a refusal. The prompt goes in on stdin.
+- **Pass a large prompt as an argv argument** — a single argument is capped at 131072 bytes
+  (`MAX_ARG_STRLEN`), not the 2MB `ARG_MAX`; past that the exec fails with `E2BIG` and never
+  starts pi, which is indistinguishable from a silent no-op run. Stdin is unbounded.
+- **Omit `--thinking`, or default it high** — the level otherwise comes from
+  `settings.json` (`xhigh` on the reference host), and thinking shares one 16,384-token output
+  budget it can consume entirely before the first tool call, producing a silent no-op run.
+  `medium` was measured failing on a real task. Pass the flag explicitly; default `low`.
+- **Unanchor the pkill pattern** — `pkill -f 'pi -p'` matches the dispatch script's own shell
+  command line and kills the run from inside itself. Keep `(^|/)`.
 - **Trust `out.txt` after a timeout** — stdout is buffered and lost on kill; judge progress from
   git state in the worktree.
 - **Shrug off a no-output run as "the model failed"** — read `stopReason` from the newest session
