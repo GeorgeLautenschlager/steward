@@ -109,8 +109,11 @@ implementer (and its fixes) run locally.
 3. **Append this skill's footer**, `./local-implementer-footer.md`, verbatim. The footer
    reconciles the interactive base body with headless execution and defines the machine-parseable
    `STATUS:` contract. It stays last — it says "read this last."
-4. Write the assembled prompt to a temp file and pass it to pi with `@file` (no arg/stdin size
-   ceiling).
+4. Write the assembled prompt to a temp file and pass its **contents as the prompt argument**
+   (`pi -p "$(cat "$PROMPT")"`). Do **not** deliver it with `@file`: pi treats `@file` content as
+   an untrusted *attachment*, not as the operator's prompt, and refuses to follow the instructions
+   inside it — the run dies with a refusal instead of implementing. Argv is the trusted channel,
+   and Linux's ~2MB argv ceiling is ample for any sane context pack.
 
 ### Steward Dispatch Payload
 
@@ -166,9 +169,9 @@ PROMPT=$(mktemp)
 cd "$WORKTREE"
 BASE_SHA=$(git rev-parse HEAD)                 # capture BEFORE the run, for the quality reviewer
 
-pkill -x pi 2>/dev/null                        # no stray implementer from a prior dispatch (see below)
+pkill -f '(^|/)pi -p' 2>/dev/null              # clear stray HEADLESS implementers only (see below)
 timeout -k 10 --signal=TERM "$BUDGET_SECONDS" \
-  pi -p --thinking xhigh @"$PROMPT" \
+  pi -p --thinking high "$(cat "$PROMPT")" \
   > out.txt 2> err.txt
 rc=$?
 
@@ -190,11 +193,19 @@ HEAD_SHA=$(git rev-parse HEAD)                  # capture AFTER, for the quality
   generation; the orphaned generation then wedges the local model so every *subsequent* dispatch
   hangs on its first inference (frozen, empty output) until you kill the strays. SIGTERM lets pi
   abort the generation and clean up its children; `-k 10` is a 10s backstop if it ignores TERM.
-  The defensive `pkill -x pi` before each dispatch clears any orphan a previous run left behind.
-  (This was the single biggest failure mode in the e2e shakedown — see brief §11.)
-- **`--thinking xhigh`** — the maximum thinking level (`off, minimal, low, medium, high, xhigh`).
-  Implementation runs get the model's full reasoning budget; lower it only if latency becomes a
-  problem on a given plan.
+  The defensive `pkill -f '(^|/)pi -p'` before each dispatch clears any orphan a previous run
+  left behind. (This was the single biggest failure mode in the e2e shakedown — see brief §11.)
+- **Scope the pkill to headless runs — never `pkill -x pi`.** `pkill -x pi` matches *every*
+  process named `pi`, including an interactive pi session the human has open in another terminal
+  — it kills their session out from under them. The `-f '(^|/)pi -p'` pattern matches only
+  print-mode (headless) invocations, which are the only ones this skill dispatches and therefore
+  the only ones it may kill.
+- **`--thinking high`, not `xhigh`.** Thinking tokens and output tokens share one budget, and at
+  `xhigh` the local model can spend the **entire** output budget reasoning before its first tool
+  call — the run exits "cleanly" with no commits, no status line, and nothing in `out.txt`.
+  `high` leaves headroom for actual work. Raise to `xhigh` only for a specific task that
+  demonstrably needs it, and if that run comes back empty, check `stopReason` (see Reading the
+  result) before blaming the model.
 
 ### Reading the result (spike + e2e hardened — see brief §11)
 
@@ -203,11 +214,26 @@ HEAD_SHA=$(git rev-parse HEAD)                  # capture AFTER, for the quality
   exit**, so a killed run yields empty `out.txt` even if work landed. **Do not trust stdout.**
   Inspect git instead: `git -C "$WORKTREE" log --oneline "$BASE_SHA"..HEAD` and `git status`. If
   commits landed and the tree is clean, salvage as `DONE_WITH_CONCERNS` and send to review (the
-  reviewer is the real gate). Otherwise `pkill -x pi`, then treat as `BLOCKED` and re-dispatch once
-  with a larger budget; if it times out again, escalate. **A timeout is also your cue to clear
-  orphans before the next dispatch**, or it too will hang.
-- **No `STATUS:` match on a clean exit:** treat as `DONE_WITH_CONCERNS` and proceed to review —
-  let the spec reviewer catch any gap. Never block the loop on a missing/garbled status line.
+  reviewer is the real gate). Otherwise `pkill -f '(^|/)pi -p'`, then treat as `BLOCKED` and
+  re-dispatch once with a larger budget; if it times out again, escalate. **A timeout is also your
+  cue to clear orphans before the next dispatch**, or it too will hang.
+- **Clean exit, but no commits and no output:** don't guess — read the **`stopReason`** from pi's
+  session file. A no-output failure is opaque from the outside (empty `out.txt` looks identical
+  for a refusal, a token-budget exhaustion, and a provider error); the session file is the only
+  place the run says why it stopped:
+
+  ```bash
+  SESSION=$(ls -t ~/.pi/agent/sessions/*.jsonl 2>/dev/null | head -1)
+  grep -o '"stopReason"[[:space:]]*:[[:space:]]*"[^"]*"' "$SESSION" | tail -1
+  ```
+
+  Interpret it: a length/max-tokens stop means the output budget ran out — usually thinking burn
+  (see `--thinking` above); lower the thinking level and re-dispatch fresh. An error stop means
+  the provider/model faulted — check LM Studio, clear orphans, re-dispatch. An abort means
+  something killed the run. Only after reading it do you pick between re-dispatch and escalation.
+- **No `STATUS:` match on a clean exit (but work landed):** treat as `DONE_WITH_CONCERNS` and
+  proceed to review — let the spec reviewer catch any gap. Never block the loop on a
+  missing/garbled status line.
 
 ### Fix loop — fresh session, never resume
 
@@ -221,8 +247,9 @@ chat memory:
 - `git -C "$WORKTREE" diff "$BASE_SHA"..HEAD` so it sees exactly what was built.
 - The same footer (it will read current files in the worktree directly).
 
-Dispatch the fix run with the **same Invoking discipline** as above (`pkill -x pi` first,
-`--signal=TERM -k 10`, tolerant status parse). After it commits, advance `HEAD_SHA` and re-review.
+Dispatch the fix run with the **same Invoking discipline** as above (scoped
+`pkill -f '(^|/)pi -p'` first, prompt via argv not `@file`, `--signal=TERM -k 10`, tolerant
+status parse). After it commits, advance `HEAD_SHA` and re-review.
 The cwd worktree guarantees commits land on the task branch.
 
 ### Convergence guard
@@ -333,10 +360,20 @@ Everything in the base skill's Red Flags applies. **Additionally, never:**
 - **Run `pi -p` without a `timeout` wrapper** — it hangs indefinitely on model eviction and on the
   resume bug, with no error and no output.
 - **Hard-kill pi with `--signal=KILL`** — it orphans the LM Studio server-side generation and wedges
-  the local model for every following dispatch. Use `--signal=TERM -k 10`, and `pkill -x pi` to
-  clear any orphan before the next dispatch.
+  the local model for every following dispatch. Use `--signal=TERM -k 10`, and a scoped
+  `pkill -f '(^|/)pi -p'` to clear any orphan before the next dispatch.
+- **`pkill -x pi`** — it matches every process named `pi`, interactive sessions included, and
+  kills the human's open session. Only ever kill headless print-mode processes.
+- **Deliver the prompt with `@file`** — pi treats attached files as untrusted input and refuses
+  to follow instructions inside them; the dispatch dies as a refusal. The prompt goes in as the
+  argv prompt argument.
+- **Default to `--thinking xhigh`** — thinking shares the output budget and can consume all of it
+  before the first tool call, producing a silent no-op run. Default `high`; raise per-task only.
 - **Trust `out.txt` after a timeout** — stdout is buffered and lost on kill; judge progress from
   git state in the worktree.
+- **Shrug off a no-output run as "the model failed"** — read `stopReason` from the newest session
+  file first; it distinguishes thinking burn from a provider fault from an abort, and each has a
+  different remedy.
 - **Route either reviewer to the local model** — review stays frontier.
 - **Keep bouncing a non-converging fix loop past the cap** — escalate to the human instead.
 - **Dispatch local implementers in parallel** — same as base, conflicts.
