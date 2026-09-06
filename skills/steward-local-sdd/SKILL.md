@@ -25,12 +25,59 @@ BLOCKED you cannot resolve, genuine ambiguity, or all tasks complete.
 ## When to Use
 
 Use this instead of base subagent-driven-development when **all** of these hold:
-- You have a well-specified plan with mostly independent tasks (same precondition as base).
+- You have a well-specified plan with mostly independent tasks, whose task sections conform to
+  [Plan Requirements](#plan-requirements-the-writing-plans-handoff) (same precondition as base).
 - A local `pi -p` model is configured and reachable (see Local Dispatch Protocol).
 - You want implementation tokens off the frontier meter.
 
 If the local model isn't available, or the tasks need frontier-level reasoning to *implement*
 (not just to review), use base **superpowers:subagent-driven-development** instead.
+
+## Plan Requirements (the writing-plans handoff)
+
+This skill executes plans created by **superpowers:writing-plans**. That is a handoff, and this
+section is the contract on it. When you write or review such a plan, every task section must:
+
+**Specify behaviour, interfaces, and the test cases — never the implementation.**
+
+- **Behaviour:** what the task must do in observable terms — inputs, outputs, errors, side effects.
+- **Interfaces:** the public contract — signatures, types, and the file paths the task creates or
+  modifies.
+- **Test cases:** the concrete cases that encode correctness (inputs, expected results, how they
+  run). These are spec, not implementation: the test cases are the thing a review should be strict
+  about.
+
+No module source, no function bodies, no "write file X with this content." The frontier specifies
+what correct looks like; Blueberry writes the code that satisfies it.
+
+### Why — read before you "fix" this
+
+Measured on the Theseus surrogate-replication run (theseus #26–#30, 2026-09-04/05), where every
+plan embedded complete module source and Blueberry transcribed rather than implemented:
+
+| | |
+|---|---|
+| Billable frontier tokens | 6,684,954 |
+| Lines shipped | 2,804 |
+| Frontier lines in dispatch prompts + plans | 8,188 |
+| Frontier lines of production code authored for dispatch | 1,439 |
+| Review subagent tokens | 2,312,111 (35% of billable) |
+
+Roughly three lines of frontier scaffolding per line shipped. The compounding is the expensive
+part: because the source lived in the plan, every review finding cost a full frontier re-authoring
+**plus** a rebuilt dispatch prompt (19–36 KB each) **plus** a verbatim-diff verification.
+`replication_batch.py` went through three such rounds.
+
+**The failure mode is invisible in the status line.** A transcriber never escalates — there is
+nothing for it to be blocked *on* — so a fully inverted run reports as a flawless one: 16 dispatches,
+12 `DONE`, 2 `DONE_WITH_CONCERNS`, 0 `BLOCKED`, 0 `NEEDS_CONTEXT`, zero escalations. The inversion
+ran two days without being noticed because every signal the pipeline reports looked normal.
+"No escalations" is not evidence of health; it is equally consistent with the local model doing no
+thinking at all (see #31 for the pre-dispatch tripwire).
+
+**Interaction with #29:** if the review bar grades explanatory prose per round, a 27B model at
+`--thinking minimal` cannot meet it and plans will drift back to embedded source no matter what
+this section says. These two land together or not at all.
 
 ## The Process
 
@@ -457,6 +504,10 @@ Everything in the base skill's Red Flags applies. **Additionally, never:**
 - **Route either reviewer to the local model** — review stays frontier.
 - **Keep bouncing a non-converging fix loop past the cap** — escalate to the human instead.
 - **Dispatch local implementers in parallel** — same as base, conflicts.
+- **Embed module source in a plan's task section** — the implementer transcribes rather than
+  implements, and authoring stays on the frontier meter: the one cost this skill exists to avoid.
+  And the failure is invisible in the status line, so you will not see it happen. See
+  [Plan Requirements](#plan-requirements-the-writing-plans-handoff).
 - **Dispatch without the context pack** — an implementer that can't see the issue's decisions,
   `DECISIONS.md`, and the ledger protocol will guess instead of ledger. The payload is not optional.
 - **Dispatch the whole project brief** — it breaks context isolation and invites re-litigation of
@@ -470,7 +521,8 @@ Everything in the base skill's Red Flags applies. **Additionally, never:**
 - **superpowers:subagent-driven-development** — the parent skill; read it first. This skill reads
   its prompt templates at runtime and inherits all its principles.
 - **superpowers:using-git-worktrees** — isolated workspace; its path is the `pi -p` cwd.
-- **superpowers:writing-plans** — creates the plan this skill executes.
+- **superpowers:writing-plans** — creates the plan this skill executes; its task sections must
+  conform to [Plan Requirements](#plan-requirements-the-writing-plans-handoff).
 - **superpowers:requesting-code-review** — review template the code-quality reviewer uses.
 - **superpowers:finishing-a-development-branch** — complete development after all tasks.
 
