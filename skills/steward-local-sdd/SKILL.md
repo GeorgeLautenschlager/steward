@@ -101,17 +101,17 @@ digraph process {
         "Provide missing context, re-dispatch fresh pi -p" [shape=box style=filled fillcolor=lightyellow];
         "Dispatch spec reviewer subagent (Task, frontier)" [shape=box];
         "Spec reviewer confirms code matches spec?" [shape=diamond];
-        "Append spec stage (findings + resolution) → runlog" [shape=box style=filled fillcolor=lightblue];
+        "Append spec stage (findings + deferred + resolution) → runlog" [shape=box style=filled fillcolor=lightblue];
         "Fresh pi -p fix: feedback + diff" [shape=box style=filled fillcolor=lightyellow];
         "Dispatch code quality reviewer subagent (Task, frontier)" [shape=box];
         "Code quality reviewer approves?" [shape=diamond];
-        "Append code-quality stage (findings + resolution) → runlog" [shape=box style=filled fillcolor=lightblue];
+        "Append code-quality stage (findings + deferred + resolution) → runlog" [shape=box style=filled fillcolor=lightblue];
         "Mark task complete in TodoWrite" [shape=box];
     }
 
     "Read plan, extract all tasks with full text, note context, create TodoWrite" [shape=box];
     "More tasks remain?" [shape=diamond];
-    "Dispatch final code reviewer subagent (Task, frontier) for entire implementation" [shape=box];
+    "Dispatch final code reviewer subagent (Task, frontier) for entire implementation — final prose pass" [shape=box];
     "Use superpowers:finishing-a-development-branch" [shape=box style=filled fillcolor=lightgreen];
 
     "Read plan, extract all tasks with full text, note context, create TodoWrite" -> "Capture BASE_SHA from worktree";
@@ -123,16 +123,16 @@ digraph process {
     "Dispatch spec reviewer subagent (Task, frontier)" -> "Spec reviewer confirms code matches spec?";
     "Spec reviewer confirms code matches spec?" -> "Fresh pi -p fix: feedback + diff" [label="no"];
     "Fresh pi -p fix: feedback + diff" -> "Dispatch spec reviewer subagent (Task, frontier)" [label="re-review"];
-    "Spec reviewer confirms code matches spec?" -> "Append spec stage (findings + resolution) → runlog" [label="yes"];
-    "Append spec stage (findings + resolution) → runlog" -> "Dispatch code quality reviewer subagent (Task, frontier)";
+    "Spec reviewer confirms code matches spec?" -> "Append spec stage (findings + deferred + resolution) → runlog" [label="yes"];
+    "Append spec stage (findings + deferred + resolution) → runlog" -> "Dispatch code quality reviewer subagent (Task, frontier)";
     "Dispatch code quality reviewer subagent (Task, frontier)" -> "Code quality reviewer approves?";
     "Code quality reviewer approves?" -> "Fresh pi -p fix: feedback + diff" [label="no"];
-    "Code quality reviewer approves?" -> "Append code-quality stage (findings + resolution) → runlog" [label="yes"];
-    "Append code-quality stage (findings + resolution) → runlog" -> "Mark task complete in TodoWrite";
+    "Code quality reviewer approves?" -> "Append code-quality stage (findings + deferred + resolution) → runlog" [label="yes"];
+    "Append code-quality stage (findings + deferred + resolution) → runlog" -> "Mark task complete in TodoWrite";
     "Mark task complete in TodoWrite" -> "More tasks remain?";
     "More tasks remain?" -> "Capture BASE_SHA from worktree" [label="yes"];
-    "More tasks remain?" -> "Dispatch final code reviewer subagent (Task, frontier) for entire implementation" [label="no"];
-    "Dispatch final code reviewer subagent (Task, frontier) for entire implementation" -> "Use superpowers:finishing-a-development-branch";
+    "More tasks remain?" -> "Dispatch final code reviewer subagent (Task, frontier) for entire implementation — final prose pass" [label="no"];
+    "Dispatch final code reviewer subagent (Task, frontier) for entire implementation — final prose pass" -> "Use superpowers:finishing-a-development-branch";
 }
 ```
 
@@ -358,6 +358,11 @@ When a reviewer finds issues, **re-dispatch a fresh `pi -p`** — do **not** reu
 hard.) Statelessness is the rule, not a fallback. Give the fresh run enough to fix without prior
 chat memory:
 
+**Prose-bar findings never enter this loop.** Per-round reviewers report them under
+`Deferred (final pass)` and they go straight to the runlog — no fix dispatch, no re-review, no
+cycle counting. Only blocking (correctness) findings are "issues" here. The deferred list rides
+to the final pass, which is the only place prose gets fixed (see [review-bar.md](./review-bar.md)).
+
 - The original task description (same body).
 - The reviewer's specific findings (verbatim, with file:line references).
 - `git -C "$WORKTREE" diff "$BASE_SHA"..HEAD` so it sees exactly what was built.
@@ -377,6 +382,11 @@ exhaustion, **stop and escalate to the human** with the diff and the outstanding
 keep bouncing or ship unreviewed code. (Acceptance: an oversized task surfaces here rather than
 silently shipping.)
 
+The cap counts **blocking** cycles only; deferred prose items never count. The final pass gets
+**one** fix dispatch for its rewrites — they are mechanical, verbatim applications of the
+reviewer's exact instructions — verified by diff-match against those instructions, not by a second
+prose round. No second prose round, ever: that is the cost this split exists to remove.
+
 ## Capturing the Review Trail (runlog)
 
 In the base skill, per-task review happens in-session and the findings evaporate once the task is
@@ -391,10 +401,14 @@ fix cycles. Record the whole exchange, not just the verdict.
 
 **What each stage entry contains:**
 - The stage name (**Spec compliance** or **Code quality**) and the task it covers.
-- The reviewer's findings, **verbatim** (with the `file:line` references they gave). If the
-  reviewer approved with no findings, say so explicitly — that is still a recorded result.
-- The **resolution** for each finding: what changed and the fix commit sha, or why no change was
-  needed. A finding with no resolution is an unfinished task, not a runlog entry.
+- The reviewer's **blocking** findings, **verbatim** (with the `file:line` references they gave).
+  If the reviewer approved with no findings, say so explicitly — that is still a recorded result.
+- Any **Deferred (final pass)** items the reviewer reported, verbatim (file:line + finding + bar
+  tag), or `none`. These are *recorded*, not resolved — their resolution is the final-pass entry.
+  The trail must show what was deferred and why: the bar tag says which bar it rides on, and the
+  reason is structural (prose is graded once, at the final pass).
+- The **resolution** for each blocking finding: what changed and the fix commit sha, or why no
+  change was needed. A finding with no resolution is an unfinished task, not a runlog entry.
 
 Append as you go (create the dir/file if absent), so a mid-run crash still leaves a partial trail:
 
@@ -403,8 +417,10 @@ RUNLOG=".steward/runs/$ISSUE/runlog.md"
 mkdir -p "$(dirname "$RUNLOG")"
 cat >> "$RUNLOG" <<EOF
 ## Task: $TASK_NAME — Spec compliance
-**Findings (reviewer, verbatim):**
+**Findings (blocking, reviewer, verbatim):**
 $SPEC_FINDINGS
+**Deferred (final pass):**
+$SPEC_DEFERRED    # verbatim items with bar tags, or "none"
 **Resolution:**
 $SPEC_RESOLUTION   # fix sha(s) or "approved, no changes"
 EOF
@@ -412,6 +428,24 @@ EOF
 
 Do the same for the **Code quality** stage. Two stages per task means at least two runlog entries
 per task; a task that needed fixes shows the finding and the fix sha side by side.
+
+**Final-pass entry:** after the final-pass reviewer resolves, append one entry covering the whole
+implementation — every accumulated deferred item with its disposition (**fixed in `<sha>`** /
+**no longer present** / **item invalid — <reason>** / **escalated — <why>**), plus any new prose
+findings from the sweep and their fix sha(s). This is where deferred items get their resolution:
+
+```bash
+cat >> "$RUNLOG" <<EOF
+## Final pass — prose bar (whole implementation)
+**Deferred items dispositioned:**
+$DEFERRED_DISPOSITIONS   # one line per item: fixed in <sha> | no longer present | item invalid — reason | escalated — why
+**New prose findings + resolution:**
+$FINAL_FINDINGS          # fix sha(s) or "none"
+EOF
+```
+
+A deferred item that reaches the end of the run without a final-pass disposition died, which is a
+bug — same class as a stage dying in-session.
 
 ## Model Selection
 
@@ -460,14 +494,24 @@ upstream pulls conflict-free and the most-likely-to-improve files shared.
   `superpowers:subagent-driven-development/implementer-prompt.md`. It is wrapped, not edited:
   the [steward context pack](#steward-dispatch-payload) is prepended and `./local-implementer-footer.md`
   appended.
-- **Steward implementer-facing files (this skill owns):** `./local-implementer-footer.md` (headless
-  STATUS contract, byte-identical to the fork) and `./ledger-protocol.md` (the ambiguity/ledger
-  capsule that rides in the context pack).
-- **Spec reviewer:** `superpowers:subagent-driven-development/spec-reviewer-prompt.md`, used as-is;
-  its findings and resolution are appended to the [runlog](#capturing-the-review-trail-runlog).
+- **Steward-owned files (this skill owns, all wrapped at dispatch time):**
+  `./local-implementer-footer.md` (headless STATUS contract, byte-identical to the fork),
+  `./ledger-protocol.md` (the ambiguity/ledger capsule that rides in the context pack), and
+  `./review-bar.md` (the two-bar split — appended **last** to **every** reviewer dispatch; the file
+  states both bars and each reviewer finds its own pass: per-round or final. It goes last because
+  it overrides the upstream template's single combined bar and single verdict).
+- **Spec reviewer:** `superpowers:subagent-driven-development/spec-reviewer-prompt.md`, used as-is
+  **with `./review-bar.md` appended last** (per-round mode: blocking bar only; prose findings
+  reported as `Deferred (final pass)`, never bounced);
+  its findings, deferred items, and resolution are appended to the [runlog](#capturing-the-review-trail-runlog).
 - **Code-quality reviewer:** `superpowers:subagent-driven-development/code-quality-reviewer-prompt.md`,
-  used as-is — it calls `superpowers:requesting-code-review` with `BASE_SHA`/`HEAD_SHA`, which the
+  used as-is **with `./review-bar.md` appended last** (same per-round mode) — it calls
+  `superpowers:requesting-code-review` with `BASE_SHA`/`HEAD_SHA`, which the
   Local Dispatch Protocol captures from the worktree.
+- **Final reviewer:** the code-quality template over the **entire implementation**
+  (`BASE_SHA`..`HEAD` across all tasks) **with `./review-bar.md` appended last, in final-pass
+  mode**, plus the accumulated `Deferred (final pass)` list from the runlogs. It is the prose pass — one fix
+  cycle, per the [Convergence guard](#convergence-guard).
 
 ## Red Flags
 
@@ -503,6 +547,10 @@ Everything in the base skill's Red Flags applies. **Additionally, never:**
   different remedy.
 - **Route either reviewer to the local model** — review stays frontier.
 - **Keep bouncing a non-converging fix loop past the cap** — escalate to the human instead.
+- **Bounce a prose finding in a per-round pass** — docstring/comment/naming/why findings are
+  collected as `Deferred (final pass)` and ride to the final pass; only blocking (correctness)
+  findings enter the fix loop. Grading prose per round is what pushed every module back to
+  frontier authoring (#29).
 - **Dispatch local implementers in parallel** — same as base, conflicts.
 - **Embed module source in a plan's task section** — the implementer transcribes rather than
   implements, and authoring stays on the frontier meter: the one cost this skill exists to avoid.
