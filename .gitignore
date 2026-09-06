@@ -2,3 +2,6 @@
 # .steward/metrics.jsonl is deliberately NOT ignored — it is committed.
 # Policy authority: docs/CONVENTIONS.md.
 .steward/runs/
+
+# Python bytecode from the controller tools (skills/steward-local-sdd/tools/).
+__pycache__/
