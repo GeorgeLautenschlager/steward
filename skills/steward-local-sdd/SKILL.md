@@ -86,8 +86,11 @@ local `pi -p` call instead of a Task subagent. Both reviewers remain Task subage
 two things on top: every dispatch carries the [Steward Dispatch Payload](#steward-dispatch-payload)
 (issue + its Decisions & Defaults + `DECISIONS.md` + ledger protocol — deliberately not the brief),
 and each resolved review stage is persisted to
-the [runlog](#capturing-the-review-trail-runlog) instead of dying in-session (the two `→ runlog`
-notes in the graph).
+the [runlog](#capturing-the-review-trail-runlog) instead of dying in-session (the `→ runlog`
+notes in the graph). Two controller-side checks bracket the implementer: the
+[inversion tripwire](#pre-dispatch-inversion-check) before the dispatch, and the
+[mutation gate](#mutation-gates--one-call-one-table) after the spec stage. Both are mechanical,
+both run as one call, and neither is ever dispatched to the local model.
 
 ```dot
 digraph process {
@@ -96,7 +99,11 @@ digraph process {
     subgraph cluster_per_task {
         label="Per Task";
         "Capture BASE_SHA from worktree" [shape=box];
+        "Assemble prompt; inversion tripwire clean?" [shape=diamond];
+        "REFUSE: prompt embeds target source — fix the plan, re-assemble" [shape=box style=filled fillcolor=lightpink];
         "Dispatch LOCAL implementer via pi -p (body + local-implementer-footer.md)" [shape=box style=filled fillcolor=lightyellow];
+        "Append dispatch line (prompt_bytes / lines shipped) → runlog" [shape=box style=filled fillcolor=lightblue];
+        "Controller runs mutation gate (one call, one table)" [shape=box];
         "Parse trailing STATUS line / handle timeout" [shape=diamond];
         "Provide missing context, re-dispatch fresh pi -p" [shape=box style=filled fillcolor=lightyellow];
         "Dispatch spec reviewer subagent (Task, frontier)" [shape=box];
@@ -115,8 +122,12 @@ digraph process {
     "Use superpowers:finishing-a-development-branch" [shape=box style=filled fillcolor=lightgreen];
 
     "Read plan, extract all tasks with full text, note context, create TodoWrite" -> "Capture BASE_SHA from worktree";
-    "Capture BASE_SHA from worktree" -> "Dispatch LOCAL implementer via pi -p (body + local-implementer-footer.md)";
-    "Dispatch LOCAL implementer via pi -p (body + local-implementer-footer.md)" -> "Parse trailing STATUS line / handle timeout";
+    "Capture BASE_SHA from worktree" -> "Assemble prompt; inversion tripwire clean?";
+    "Assemble prompt; inversion tripwire clean?" -> "REFUSE: prompt embeds target source — fix the plan, re-assemble" [label="no"];
+    "REFUSE: prompt embeds target source — fix the plan, re-assemble" -> "Assemble prompt; inversion tripwire clean?";
+    "Assemble prompt; inversion tripwire clean?" -> "Dispatch LOCAL implementer via pi -p (body + local-implementer-footer.md)" [label="yes"];
+    "Dispatch LOCAL implementer via pi -p (body + local-implementer-footer.md)" -> "Append dispatch line (prompt_bytes / lines shipped) → runlog";
+    "Append dispatch line (prompt_bytes / lines shipped) → runlog" -> "Parse trailing STATUS line / handle timeout";
     "Parse trailing STATUS line / handle timeout" -> "Provide missing context, re-dispatch fresh pi -p" [label="NEEDS_CONTEXT"];
     "Provide missing context, re-dispatch fresh pi -p" -> "Parse trailing STATUS line / handle timeout";
     "Parse trailing STATUS line / handle timeout" -> "Dispatch spec reviewer subagent (Task, frontier)" [label="DONE / DONE_WITH_CONCERNS"];
@@ -124,7 +135,9 @@ digraph process {
     "Spec reviewer confirms code matches spec?" -> "Fresh pi -p fix: feedback + diff" [label="no"];
     "Fresh pi -p fix: feedback + diff" -> "Dispatch spec reviewer subagent (Task, frontier)" [label="re-review"];
     "Spec reviewer confirms code matches spec?" -> "Append spec stage (findings + deferred + resolution) → runlog" [label="yes"];
-    "Append spec stage (findings + deferred + resolution) → runlog" -> "Dispatch code quality reviewer subagent (Task, frontier)";
+    "Append spec stage (findings + deferred + resolution) → runlog" -> "Controller runs mutation gate (one call, one table)";
+    "Controller runs mutation gate (one call, one table)" -> "Fresh pi -p fix: feedback + diff" [label="a row did not catch its defect"];
+    "Controller runs mutation gate (one call, one table)" -> "Dispatch code quality reviewer subagent (Task, frontier)" [label="every row caught"];
     "Dispatch code quality reviewer subagent (Task, frontier)" -> "Code quality reviewer approves?";
     "Code quality reviewer approves?" -> "Fresh pi -p fix: feedback + diff" [label="no"];
     "Code quality reviewer approves?" -> "Append code-quality stage (findings + deferred + resolution) → runlog" [label="yes"];
@@ -156,7 +169,10 @@ implementer (and its fixes) run locally.
 3. **Append this skill's footer**, `./local-implementer-footer.md`, verbatim. The footer
    reconciles the interactive base body with headless execution and defines the machine-parseable
    `STATUS:` contract. It stays last — it says "read this last."
-4. Write the assembled prompt to a temp file and feed it to pi **on stdin**
+4. **Run the inversion tripwire on the assembled prompt** before it goes anywhere
+   (see [Pre-dispatch Inversion Check](#pre-dispatch-inversion-check)). A prompt that already
+   contains the module it is asking for is not a dispatch; it is transcription with extra steps.
+5. Write the assembled prompt to a temp file and feed it to pi **on stdin**
    (`pi -p ... < "$PROMPT"`). Do **not** deliver it with `@file`: pi treats `@file` content as
    an untrusted *attachment*, not as the operator's prompt, and refuses to follow the instructions
    inside it — the run dies with a refusal instead of implementing.
@@ -222,6 +238,13 @@ PROMPT=$(mktemp)
 
 cd "$WORKTREE"
 BASE_SHA=$(git rev-parse HEAD)                 # capture BEFORE the run, for the quality reviewer
+
+# Refuse to dispatch a prompt that already contains the target module (#31).
+# --target once per file the task says it creates or modifies. Records the
+# prompt size for the runlog's ratio line; drop --warn-only at your peril.
+CHECK=$("$SKILL_DIR/tools/check-inversion.py" --prompt "$PROMPT" --root "$WORKTREE" \
+          --target "$TARGET_1" --target "$TARGET_2") || { echo "$CHECK"; exit 1; }
+PROMPT_BYTES=${CHECK##*prompt_bytes=}
 
 # Clear stray HEADLESS implementers only. pi's process title is bare `pi` — its arguments
 # are NOT visible to pkill -f — so headless runs are identified by having no tty. (See below.)
@@ -387,6 +410,136 @@ The cap counts **blocking** cycles only; deferred prose items never count. The f
 reviewer's exact instructions — verified by diff-match against those instructions, not by a second
 prose round. No second prose round, ever: that is the cost this split exists to remove.
 
+## Pre-dispatch Inversion Check
+
+`tools/check-inversion.py` refuses a dispatch whose prompt already carries the module it is asking
+for. Run it on the assembled prompt, before pi sees it:
+
+```bash
+"$SKILL_DIR/tools/check-inversion.py" \
+  --prompt "$PROMPT" --root "$WORKTREE" \
+  --target src/replication.py --target src/scoring.py     # every file the task creates or modifies
+```
+
+Exit 0 is clean and prints `prompt_bytes=N` for the runlog; exit 1 names the offending files and
+refuses. `--warn-only` downgrades the refusal to a warning — use it while migrating an existing
+plan, not as the standing setting.
+
+**Why a mechanical check rather than judgement.** The inversion described in
+[Plan Requirements](#plan-requirements-the-writing-plans-handoff) ran for two days on the Theseus
+run unnoticed, and the reason is that **it is invisible in every signal this pipeline reports**.
+Across 16 dispatches:
+
+| Outcome | Count |
+|---|---|
+| `DONE` | 12 |
+| `DONE_WITH_CONCERNS` | 2 |
+| `BLOCKED` | 0 |
+| `NEEDS_CONTEXT` | 0 |
+| silent infra failure | 2 |
+
+Zero escalations. A transcriber never escalates — there is nothing for it to be blocked *on* — so
+a fully inverted run reports as a flawless one. **"No escalations" is not evidence of health;** on
+its own it is equally consistent with the local model doing no thinking at all. Nothing in the
+status line, the review verdicts, or the runlog would have caught this. A substring test would
+have, on the first dispatch.
+
+**What it does and does not catch.** It flags a fenced block holding a target file's source —
+either matching a file already in the worktree, or a block attributed to a path the task is about
+to create. Two blocks are exempt by design:
+
+- **Test code.** Tests are the contract; a plan is *supposed* to carry them (#28). A block
+  containing `def test_`/`assert` never trips the check, and neither does a target on a test path.
+- **Unified diffs.** Every fix re-dispatch carries `git diff "$BASE_SHA"..HEAD`, whose context
+  lines match the file exactly. Without this exemption the second round of every task trips, and a
+  check that cries wolf on the common path is one people route around. **The residual gap is
+  real:** module source smuggled inside a ` ```diff ` fence is not caught. The fenced diff belongs
+  to the fix loop and nothing else — if you find yourself putting anything else in one, that is the
+  inversion wearing a hat.
+
+**The softer signal: prompt bytes against lines shipped.** Record both per dispatch (see the
+runlog format below). The Theseus run was roughly 3:1 scaffolding-to-code and nobody could see it
+until it was measured after the fact. A ratio that climbs across a run is the tripwire's early
+warning — the prompt growing to carry work the local model is no longer doing.
+
+**And the signal that argues the other way.** Those two `DONE_WITH_CONCERNS` were the local model
+**catching the controller's bugs**: a future-dated test fixture, a `line(seq, ...)` keyword
+collision, a conflated origin field in a test helper, and a broken verification script. Four
+defects in the frontier's own work, reported rather than worked around. That is what the loop adds
+even on a task where the local model writes nothing original — so the remedy for an inversion is
+to fix the plan, never to drop the local model.
+
+## Mutation Gates — one call, one table
+
+A test that passes against its own reverted fix is not a test. The gate proves each one: revert
+the fix, require the test to fail, restore, require it to pass. It earns its keep — on the Theseus
+run it caught **three tests that passed against their own reverted fix**, including a threading
+test that looked correct and detected nothing.
+
+**Run it as one script, never as N conversational turns.** An eight-row gate run turn-by-turn is
+sixteen runner invocations, sixteen tool results in context, and sixteen turns of a context that
+averaged ~288K tokens read per turn — on the frontier meter. The same evidence as one call is one
+turn. (That run made 403 Bash calls and wrote 2,673 lines of gate and probe scripts; its later
+rounds ran gates as single scripts and its early ones did not, and the difference is roughly an
+order of magnitude in turns.)
+
+```bash
+"$SKILL_DIR/tools/mutation-gate.py" --rows gate-rows.json --root "$WORKTREE"
+```
+
+Rows are `(file, label, old, new, selector)`, where `old` is the fix as it stands in the tree and
+`new` is what the file said before it:
+
+```json
+{
+  "cwd": "proj",
+  "command": ["python3", "-m", "pytest", "-q", "{selector}"],
+  "rows": [
+    {"label": "splitlines not split(chr(10))", "file": "calc.py",
+     "old": "return text.splitlines()", "new": "return text.split(chr(10))",
+     "selector": "test_calc.py::test_split_lines"}
+  ]
+}
+```
+
+It applies each revert, runs the selector, restores, and **asserts every source is byte-identical
+afterwards**. Output is one table:
+
+```
+row                                    reverted                    restored
+1  RecursionError -> 4xx               1 failed, 45 deselected     1 passed, 45 deselected
+2  split(chr(10)) not splitlines()     3 failed, 43 deselected     3 passed, 43 deselected
+...
+every row caught its defect
+```
+
+Exit 0 only when every row caught its defect. Anything else exits non-zero and says which row and
+why: `anchor not found`, `anchor ambiguous (N matches)`, `did not catch its defect`, or `SUSPECT`.
+
+**Two lessons from operating it, both now mechanical:**
+
+- **The summary line is matched by regex, not by position.** A first attempt parsed "the last
+  non-warning line" and picked up a deprecation warning instead of the result, reporting seven
+  false gate failures. Any positional parse breaks the moment a runner prints anything after its
+  own summary.
+- **A green row is only evidence if the mutation reaches the behaviour.** Twice a row looked green
+  because the *mutation* was mis-targeted, not because the test was good — once removing a branch
+  the case under test never reaches. The runner flags a reverted half that dies at import or
+  collection as `SUSPECT` rather than counting it as caught: the module broke, so the test's
+  failure says nothing about the behaviour. **A `SUSPECT` row is not a gate pass** — retarget the
+  mutation at the behaviour and re-run that row.
+
+**The controller runs the gate. Never dispatch it.** An N-repetition mechanical verification is
+the wrong shape to hand a local implementer: it is the same operation N times with no judgement in
+it, the transcript grows with every repetition, and one such dispatch died on pi's 80K context
+window mid-gate — leaving a half-reverted tree. The gate is cheap in the controller's hands (one
+call) and expensive in anyone else's.
+
+**If the gate leaves the tree dirty it says so and stops.** A failed restore prints `RESTORE
+FAILED`, names the file and the backup directory holding the originals, and exits non-zero without
+reporting a verdict on the remaining rows. Restore by hand before running anything else — a gate
+result read off a dirty tree is worse than no gate at all.
+
 ## Capturing the Review Trail (runlog)
 
 In the base skill, per-task review happens in-session and the findings evaporate once the task is
@@ -415,6 +568,16 @@ Append as you go (create the dir/file if absent), so a mid-run crash still leave
 ```bash
 RUNLOG=".steward/runs/$ISSUE/runlog.md"
 mkdir -p "$(dirname "$RUNLOG")"
+
+# One line per dispatch, written as the dispatch happens: the scaffolding-to-code
+# ratio, so an inversion is visible DURING the run instead of in a post-mortem (#31).
+SHIPPED=$(git -C "$WORKTREE" diff --numstat "$BASE_SHA"..HEAD | awk '{a+=$1} END {print a+0}')
+cat >> "$RUNLOG" <<EOF
+## Dispatch: $TASK_NAME
+prompt_bytes=$PROMPT_BYTES  lines_shipped=$SHIPPED  bytes_per_line=$((PROMPT_BYTES / (SHIPPED > 0 ? SHIPPED : 1)))
+thinking=$THINKING_LEVEL  status=$STATUS  inversion_check=pass
+EOF
+
 cat >> "$RUNLOG" <<EOF
 ## Task: $TASK_NAME — Spec compliance
 **Findings (blocking, reviewer, verbatim):**
@@ -428,6 +591,18 @@ EOF
 
 Do the same for the **Code quality** stage. Two stages per task means at least two runlog entries
 per task; a task that needed fixes shows the finding and the fix sha side by side.
+
+**Ratio line — what to watch.** `bytes_per_line` is the softer half of the inversion tripwire.
+Read it across the run, not per dispatch: a single scaffolding-heavy task is normal, a ratio
+climbing task over task is the prompt taking over work the local model has stopped doing. The
+Theseus run sat at roughly 3:1 scaffolding-to-code and nobody saw it until it was measured
+afterwards. There is no threshold to enforce here — the mechanical gate is the tripwire; this line
+exists so the trend is visible while there is still a run left to correct.
+
+**Gate table.** When a task's tests pin new behaviour, paste the
+[mutation gate](#mutation-gates--one-call-one-table) table into that task's entry verbatim. It is
+the evidence that the tests in the diff are worth anything, and it is one table, so it costs the
+runlog nothing to carry it.
 
 **Final-pass entry:** after the final-pass reviewer resolves, append one entry covering the whole
 implementation — every accumulated deferred item with its disposition (**fixed in `<sha>`** /
@@ -500,6 +675,11 @@ upstream pulls conflict-free and the most-likely-to-improve files shared.
   `./review-bar.md` (the two-bar split — appended **last** to **every** reviewer dispatch; the file
   states both bars and each reviewer finds its own pass: per-round or final. It goes last because
   it overrides the upstream template's single combined bar and single verdict).
+- **Steward controller tools (this skill owns; never dispatched, never sent to a model):**
+  `./tools/check-inversion.py` (the [pre-dispatch tripwire](#pre-dispatch-inversion-check)) and
+  `./tools/mutation-gate.py` (the [gate runner](#mutation-gates--one-call-one-table)). Both are
+  Python 3 stdlib only and are run by the controller from the shell. Their acceptance tests are
+  `./tools/tests/run-tests.sh` — run it after touching either.
 - **Spec reviewer:** `superpowers:subagent-driven-development/spec-reviewer-prompt.md`, used as-is
   **with `./review-bar.md` appended last** (per-round mode: blocking bar only; prose findings
   reported as `Deferred (final pass)`, never bounced);
@@ -551,6 +731,15 @@ Everything in the base skill's Red Flags applies. **Additionally, never:**
   collected as `Deferred (final pass)` and ride to the final pass; only blocking (correctness)
   findings enter the fix loop. Grading prose per round is what pushed every module back to
   frontier authoring (#29).
+- **Dispatch a prompt that fails the inversion tripwire** — a prompt carrying the target module's
+  source is transcription, and it reports as a flawless run. Fix the plan, not the check (#31).
+- **Read "no escalations" as evidence of health** — a transcriber has nothing to be blocked on, so
+  an inverted run and a healthy one produce the same status line (#31).
+- **Dispatch a mutation gate to the implementer** — an N-repetition mechanical verification is the
+  wrong shape for a dispatch; one died on pi's 80K context window mid-gate, leaving a half-reverted
+  tree. The controller runs it, as one call (#30).
+- **Run a gate turn-by-turn** — sixteen invocations and sixteen turns for evidence that fits in one
+  table, paid for on the frontier meter (#30).
 - **Dispatch local implementers in parallel** — same as base, conflicts.
 - **Embed module source in a plan's task section** — the implementer transcribes rather than
   implements, and authoring stays on the frontier meter: the one cost this skill exists to avoid.
