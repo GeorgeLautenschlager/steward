@@ -1,8 +1,11 @@
 # Review Bar — two bars, two schedules
 
-> Appended by the controller to the **unchanged** upstream reviewer prompt at dispatch time.
-> The upstream reviewer templates are never edited (see SKILL.md → Prompt Templates).
-> Find your pass below before you grade.
+> Appended **last** by the controller to the **unchanged** upstream reviewer prompt at dispatch
+> time. The upstream reviewer templates are never edited (see SKILL.md → Prompt Templates).
+> **Read this last — it overrides the grading scope and the verdict of anything above.** The
+> upstream template grades correctness and prose as one bar and returns one verdict for both;
+> this capsule splits them, and where the two disagree this capsule wins. Find your pass below
+> before you grade.
 
 The review bar has two parts, graded on different schedules:
 
@@ -31,6 +34,14 @@ finished module**, not N times over N drafts.
 - The controller records these in the runlog and hands them to the final pass. **No fix cycle
   will be dispatched for them** — do not phrase them as blockers or wait on one.
 - If you have no blocking findings, approve; the deferred list rides along with your approval.
+- **Reconciling with the upstream output format.** Keep the structure the template asked for
+  (`Strengths` / `Issues` / `Recommendations` / `Assessment`), with two amendments. Everything
+  under **Issues** is a blocking finding, so a prose item never goes there — not under *Minor*,
+  not as *documentation polish*, not as a *Recommendation*; it goes under the
+  `## Deferred (final pass)` heading and nowhere else. And **Ready to merge** answers the
+  blocking bar alone: a round with prose findings and none on the blocking bar is
+  `Ready to merge: Yes` with a non-empty deferred list underneath. `With fixes` is read by the
+  controller as "dispatch a fix cycle", so spend it only on the blocking bar.
 
 ## If you are the final-pass reviewer (reviewing the entire implementation, after all tasks)
 
@@ -46,3 +57,5 @@ grades prose.
   so a local fix dispatch can apply it without judgment.
 - One fix cycle is allowed for this pass; if it does not converge, escalate per the convergence
   guard. Do not open a second prose round — note the remainder and let the controller decide.
+- Use the upstream output format as written: at this pass prose findings *are* the blocking bar,
+  so they belong under **Issues**, and `Ready to merge` covers both bars.

@@ -497,19 +497,20 @@ upstream pulls conflict-free and the most-likely-to-improve files shared.
 - **Steward-owned files (this skill owns, all wrapped at dispatch time):**
   `./local-implementer-footer.md` (headless STATUS contract, byte-identical to the fork),
   `./ledger-protocol.md` (the ambiguity/ledger capsule that rides in the context pack), and
-  `./review-bar.md` (the two-bar split — appended to **every** reviewer dispatch; the file states
-  both bars and each reviewer finds its own pass: per-round or final).
+  `./review-bar.md` (the two-bar split — appended **last** to **every** reviewer dispatch; the file
+  states both bars and each reviewer finds its own pass: per-round or final. It goes last because
+  it overrides the upstream template's single combined bar and single verdict).
 - **Spec reviewer:** `superpowers:subagent-driven-development/spec-reviewer-prompt.md`, used as-is
-  **with `./review-bar.md` appended** (per-round mode: blocking bar only; prose findings reported
-  as `Deferred (final pass)`, never bounced);
+  **with `./review-bar.md` appended last** (per-round mode: blocking bar only; prose findings
+  reported as `Deferred (final pass)`, never bounced);
   its findings, deferred items, and resolution are appended to the [runlog](#capturing-the-review-trail-runlog).
 - **Code-quality reviewer:** `superpowers:subagent-driven-development/code-quality-reviewer-prompt.md`,
-  used as-is **with `./review-bar.md` appended** (same per-round mode) — it calls
+  used as-is **with `./review-bar.md` appended last** (same per-round mode) — it calls
   `superpowers:requesting-code-review` with `BASE_SHA`/`HEAD_SHA`, which the
   Local Dispatch Protocol captures from the worktree.
 - **Final reviewer:** the code-quality template over the **entire implementation**
-  (`BASE_SHA`..`HEAD` across all tasks) **with `./review-bar.md` appended in final-pass mode**, plus
-  the accumulated `Deferred (final pass)` list from the runlogs. It is the prose pass — one fix
+  (`BASE_SHA`..`HEAD` across all tasks) **with `./review-bar.md` appended last, in final-pass
+  mode**, plus the accumulated `Deferred (final pass)` list from the runlogs. It is the prose pass — one fix
   cycle, per the [Convergence guard](#convergence-guard).
 
 ## Red Flags
